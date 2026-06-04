@@ -65,6 +65,10 @@ jobs:
         # 7. Add -Wno-attributes globally to suppress log2.h warning
         sed -i '/KBUILD_CFLAGS.*FRAME_WARN/a KBUILD_CFLAGS\t+= -Wno-attributes -Wno-error=attributes' Makefile
 
+        # 8. Fix f_rndis.c USB gadget compile error (uint type not declared)
+        sed -i 's/^#include <linux\/usb\/cdc.h>/#include <linux\/usb\/cdc.h>
+#include <linux\/types.h>/' drivers/usb/gadget/f_rndis.c
+
         echo "All patches applied"
 
     - name: Create YS-M1 panel DTSI

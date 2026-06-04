@@ -307,7 +307,7 @@ jobs:
         scripts/config --disable CONFIG_ROCKCHIP_WLAN
         make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf-10- olddefconfig
 
- - name: Build kernel
+    - name: Build kernel
       working-directory: rk3128-kernel
       run: |
         make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf-10- -j$(nproc) zImage rk3128-ys-m1.dtb 2>&1 | tee build.log || true

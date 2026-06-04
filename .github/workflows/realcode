@@ -1,0 +1,323 @@
+
+name: Build YS-M1 RK3128 Kernel
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          gcc-arm-linux-gnueabihf \
+          make bc libssl-dev bison flex \
+          device-tree-compiler git python3 \
+          gcc-10-arm-linux-gnueabihf \
+          cpp-10-arm-linux-gnueabihf
+
+    - name: Create GCC 10 symlinks
+      run: |
+        sudo ln -sf /usr/bin/arm-linux-gnueabihf-gcc-10 /usr/local/bin/arm-linux-gnueabihf-10-gcc
+        sudo ln -sf /usr/bin/arm-linux-gnueabihf-cpp-10 /usr/local/bin/arm-linux-gnueabihf-10-cpp
+        for tool in ld as ar nm objcopy objdump strip; do
+          [ -f /usr/bin/arm-linux-gnueabihf-$tool ] && \
+            sudo ln -sf /usr/bin/arm-linux-gnueabihf-$tool /usr/local/bin/arm-linux-gnueabihf-10-$tool || true
+        done
+        arm-linux-gnueabihf-10-gcc --version
+
+    - name: Clone RK3128 kernel
+      run: |
+        git clone --depth=1 -b release-3.10 \
+          https://github.com/rockchip-linux/kernel.git rk3128-kernel
+
+    - name: Apply compatibility patches
+      working-directory: rk3128-kernel
+      run: |
+        # 1. Disable gcc-wrapper (blocks build with modern GCC warnings)
+        sed -i 's|CC\t\t= \$(srctree)/scripts/gcc-wrapper.py \$(CROSS_COMPILE)gcc|CC\t\t= $(CROSS_COMPILE)gcc|' Makefile
+
+        # 2. Fix dtc yylloc duplicate symbol for newer binutils
+        sed -i 's/YYLTYPE yylloc/extern YYLTYPE yylloc/' scripts/dtc/dtc-lexer.lex.c_shipped
+
+        # 3. Fix ARM assembly section flags for new binutils (#alloc -> "ax")
+        find arch/arm -name "*.S" | xargs sed -i \
+          's/, #alloc, #execinstr/,"ax"/g
+           s/#alloc,#execinstr/"ax"/g
+           s/, #alloc/,"a"/g' 2>/dev/null || true
+
+        # 4. Force armv7-a march flag (fixes cpsid/dmb assembler errors)
+        sed -i 's/arch-\$(CONFIG_CPU_32v7)\t\t:=-D__LINUX_ARM_ARCH__=7 \$(call cc-option,-march=armv7-a,-march=armv5t -Wa\$(comma)-march=armv7-a)/arch-$(CONFIG_CPU_32v7)\t\t:=-D__LINUX_ARM_ARCH__=7 -march=armv7-a/' arch/arm/Makefile
+
+        # 5. Disable __asmeq checks (GCC 10 enforces register allocation itself)
+        sed -i 's|#define __asmeq(x, y).*$|#define __asmeq(x, y) "" /* disabled for GCC 10+ */|' \
+          arch/arm/include/asm/compiler.h
+
+        # 6. Fix Werror in optee driver
+        find security/optee_linuxdriver -name "Makefile" -exec \
+          sed -i 's/ccflags-y+=-Werror/ccflags-y+=-Wno-error/g' {} \;
+
+        # 7. Add -Wno-attributes globally to suppress log2.h warning
+        sed -i '/KBUILD_CFLAGS.*FRAME_WARN/a KBUILD_CFLAGS\t+= -Wno-attributes -Wno-error=attributes' Makefile
+
+        echo "All patches applied"
+
+    - name: Create YS-M1 panel DTSI
+      working-directory: rk3128-kernel
+      run: |
+        cat > arch/arm/boot/dts/lcd-ys-m1-ili9881c-mipi.dtsi << 'DTSI'
+        #include <dt-bindings/rkmipi/mipi_dsi.h>
+
+        / {
+          disp_mipi_init: mipi_dsi_init {
+            compatible = "rockchip,mipi_dsi_init";
+            rockchip,screen_init = <1>;
+            rockchip,dsi_lane = <4>;
+            rockchip,dsi_hs_clk = <500>;
+            rockchip,mipi_dsi_num = <1>;
+          };
+
+          disp_mipi_power_ctr: mipi_power_ctr {
+            compatible = "rockchip,mipi_power_ctr";
+          };
+
+          disp_mipi_init_cmds: screen-on-cmds {
+            compatible = "rockchip,screen-on-cmds";
+            rockchip,cmd_debug = <1>;
+            rockchip,on-cmds1   { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0xe0 0x00>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds2   { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0xe1 0x93>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds3   { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0xe2 0x65>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds4   { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0xe3 0xf8>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds5   { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x80 0x03>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds6   { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0xe0 0x01>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds7   { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x00 0x00>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds8   { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x01 0xa0>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds9   { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x17 0x00>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds10  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x18 0xb1>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds11  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x19 0x01>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds12  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x1a 0x00>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds13  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x1b 0xb1>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds14  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x1c 0x01>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds15  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x1f 0x3e>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds16  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x20 0x28>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds17  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x21 0x28>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds18  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x22 0x0e>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds19  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x26 0xf1>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds20  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x37 0x19>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds21  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x38 0x05>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds22  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x39 0x08>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds23  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x3a 0x12>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds24  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x3c 0x78>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds25  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x3d 0xff>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds26  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x3e 0xff>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds27  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x3f 0xff>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds28  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x40 0x06>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds29  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x41 0xa0>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds30  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x4b 0x04>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds31  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x55 0x01>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds32  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x56 0x01>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds33  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x57 0x89>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds34  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x58 0x0a>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds35  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x59 0x0a>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds36  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x5a 0x28>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds37  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x5b 0x14>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds38  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x5d 0x7c>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds39  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x5e 0x60>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds40  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x5f 0x50>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds41  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x60 0x43>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds42  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x61 0x3f>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds43  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x62 0x30>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds44  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x63 0x34>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds45  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x64 0x1e>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds46  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x65 0x37>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds47  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x66 0x35>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds48  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x67 0x34>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds49  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x68 0x52>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds50  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x69 0x3f>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds51  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x6a 0x44>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds52  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x6b 0x35>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds53  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x6c 0x2f>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds54  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x6d 0x21>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds55  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x6e 0x10>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds56  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x6f 0x00>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds57  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x70 0x7c>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds58  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x71 0x60>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds59  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x72 0x50>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds60  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x73 0x43>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds61  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x74 0x3f>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds62  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x75 0x30>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds63  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x76 0x34>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds64  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x77 0x1e>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds65  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x78 0x37>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds66  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x79 0x35>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds67  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x7a 0x34>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds68  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x7b 0x52>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds69  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x7c 0x3f>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds70  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x7d 0x44>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds71  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x7e 0x35>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds72  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x7f 0x2f>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds73  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x80 0x21>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds74  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x81 0x10>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds75  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x82 0x00>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds76  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0xe0 0x02>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds77  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x00 0x47>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds78  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x01 0x47>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds79  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x02 0x45>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds80  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x03 0x45>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds81  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x04 0x4b>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds82  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x05 0x4b>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds83  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x06 0x49>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds84  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x07 0x49>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds85  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x08 0x41>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds86  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x09 0x1f>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds87  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x0a 0x1f>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds88  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x0b 0x1f>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds89  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x0c 0x1f>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds90  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x0d 0x1f>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds91  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x0e 0x1f>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds92  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x0f 0x43>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds93  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x10 0x1f>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds94  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x11 0x1f>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds95  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x12 0x1f>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds96  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x13 0x1f>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds97  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x14 0x1f>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds98  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x15 0x1f>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds99  { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x16 0x46>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds100 { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x17 0x46>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds101 { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x18 0x44>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds102 { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x19 0x44>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds103 { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x1a 0x4a>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds104 { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x1b 0x4a>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds105 { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x1c 0x48>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds106 { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x1d 0x48>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds107 { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x1e 0x40>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds108 { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x1f 0x1f>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds109 { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x20 0x1f>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds110 { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x21 0x1f>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds111 { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x22 0x1f>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds112 { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x23 0x1f>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds113 { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x24 0x1f>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds114 { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x25 0x42>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds115 { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x26 0x1f>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds116 { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x27 0x1f>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds117 { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x28 0x1f>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds118 { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x29 0x1f>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds119 { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x2a 0x1f>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds120 { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x2b 0x1f>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds121 { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x58 0x40>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds122 { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x5b 0x30>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds123 { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x5c 0x02>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds124 { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x5d 0x40>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds125 { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x5e 0x01>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds126 { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x5f 0x02>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds127 { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x63 0x62>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds128 { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x64 0x62>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds129 { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x67 0x74>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds130 { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x68 0x04>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds131 { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x69 0x62>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds132 { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x6a 0x66>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds133 { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x6b 0x08>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds134 { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x6c 0x00>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds135 { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x6d 0x00>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds136 { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x6e 0x00>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds137 { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x6f 0x08>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds138 { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0xe0 0x01>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds139 { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x0e 0x01>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds140 { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0xe0 0x03>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds141 { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x98 0x2f>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds142 { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0xe0 0x04>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds143 { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x09 0x14>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds144 { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x2b 0x2b>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds145 { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x2e 0x44>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds146 { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x2d 0x03>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds147 { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0xe0 0x00>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds148 { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0xe6 0x02>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds149 { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0xe7 0x02>; rockchip,cmd_delay=<0>; };
+            rockchip,on-cmds150 { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x11 0x00>; rockchip,cmd_delay=<120>; };
+            rockchip,on-cmds151 { compatible="rockchip,on-cmds"; rockchip,cmd_type=<LPDT>; rockchip,dsi_id=<0>; rockchip,cmd=<0x15 0x29 0x00>; rockchip,cmd_delay=<20>; };
+          };
+
+          disp_timings: display-timings {
+            compatible = "rockchip,display-timings";
+            native-mode = <&timing0>;
+            timing0: timing0 {
+              screen-type = <SCREEN_MIPI>;
+              lvds-format = <LVDS_8BIT_1>;
+              out-face = <OUT_P888>;
+              clock-frequency = <68000000>;
+              hactive = <800>; vactive = <1280>;
+              hback-porch = <48>; hfront-porch = <16>; hsync-len = <16>;
+              vback-porch = <16>; vfront-porch = <8>; vsync-len = <8>;
+              hsync-active = <0>; vsync-active = <0>;
+              de-active = <0>; pixelclk-active = <0>;
+              swap-rb = <0>; swap-rg = <0>; swap-gb = <0>;
+            };
+          };
+        };
+        DTSI
+
+    - name: Create YS-M1 board DTS
+      working-directory: rk3128-kernel
+      run: |
+        cat > arch/arm/boot/dts/rk3128-ys-m1.dts << 'DTS'
+        /dts-v1/;
+        #include "rk3128.dtsi"
+        #include "rk312x-sdk.dtsi"
+        #include "lcd-ys-m1-ili9881c-mipi.dtsi"
+        / {
+          model = "Yisheng YS-M1 RK3128 Digital Signage Board";
+          compatible = "rockchip,rk3128";
+          memory { device_type = "memory"; reg = <0x60000000 0x40000000>; };
+          backlight: backlight {
+            compatible = "pwm-backlight";
+            pwms = <&pwm0 0 25000 0>;
+            brightness-levels = <0 10 20 30 40 50 60 70 80 90 100 110 120 130 140 150 160 170 180 190 200 210 220 230 240 255>;
+            default-brightness-level = <20>;
+          };
+        };
+        &pwm0 { status = "okay"; };
+        &rk_screen { display-timings = <&disp_timings>; };
+        &dsihost0 { status = "okay"; };
+        &lcdc { status = "okay"; backlight = <&backlight>; };
+        &fb { rockchip,disp-mode = <NO_DUAL>; rockchip,uboot-logo-on = <0>; };
+        DTS
+
+        # Add to DTS Makefile
+        sed -i '/rk3128-fireprime.dtb/a \\trk3128-ys-m1.dtb \\' arch/arm/boot/dts/Makefile
+
+    - name: Configure kernel
+      working-directory: rk3128-kernel
+      run: |
+        make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf-10- rockchip_defconfig
+        # Disable unnecessary drivers to reduce build time
+        scripts/config --disable CONFIG_MEDIA_SUPPORT
+        scripts/config --disable CONFIG_DVB_CORE
+        scripts/config --disable CONFIG_VIDEO_DEV
+        scripts/config --disable CONFIG_BT
+        scripts/config --disable CONFIG_SOUND
+        scripts/config --disable CONFIG_SND
+        scripts/config --disable CONFIG_NETFILTER
+        scripts/config --disable CONFIG_NF_CONNTRACK
+        scripts/config --disable CONFIG_RTL8188EU
+        scripts/config --disable CONFIG_ROCKCHIP_WLAN
+        make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf-10- olddefconfig
+
+    - name: Build kernel
+      working-directory: rk3128-kernel
+      run: |
+        make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf-10- -j$(nproc) zImage rk3128-ys-m1.dtb
+
+    - name: Upload kernel artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: ys-m1-kernel
+        path: |
+          rk3128-kernel/arch/arm/boot/zImage
+          rk3128-kernel/arch/arm/boot/dts/rk3128-ys-m1.dtb
+        retention-days: 30
